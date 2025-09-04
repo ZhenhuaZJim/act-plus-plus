@@ -56,7 +56,8 @@ def main(args):
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
     else:
-        from aloha_scripts.constants import TASK_CONFIGS
+        # from aloha_scripts.constants import TASK_CONFIGS
+        from piper_constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
     dataset_dir = task_config['dataset_dir']
     # num_episodes = task_config['num_episodes']
@@ -68,7 +69,7 @@ def main(args):
     name_filter = task_config.get('name_filter', lambda n: True)
 
     # fixed parameters
-    state_dim = 14
+    state_dim = 7
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -89,7 +90,8 @@ def main(args):
                          'vq': args['use_vq'],
                          'vq_class': args['vq_class'],
                          'vq_dim': args['vq_dim'],
-                         'action_dim': 16,
+                         'action_dim': 7,
+                         'state_dim': state_dim,
                          'no_encoder': args['no_encoder'],
                          }
     elif policy_class == 'Diffusion':
@@ -593,8 +595,8 @@ def train_bc(train_dataloader, val_dataloader, config):
             ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             torch.save(policy.serialize(), ckpt_path)
-            success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
-            wandb.log({'success': success}, step=step)
+            # success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
+            # wandb.log({'success': success}, step=step)
 
         # training
         policy.train()
