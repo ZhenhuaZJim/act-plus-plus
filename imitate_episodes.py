@@ -55,10 +55,12 @@ def main(args):
     if is_sim or task_name == 'all':
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
-    else:
+    from constants import SIM_TASK_CONFIGS
+    task_config = SIM_TASK_CONFIGS[task_name]
+    # else:
         # from aloha_scripts.constants import TASK_CONFIGS
-        from piper_constants import TASK_CONFIGS
-        task_config = TASK_CONFIGS[task_name]
+        # from piper_constants import TASK_CONFIGS
+        # task_config = TASK_CONFIGS[task_name]
     dataset_dir = task_config['dataset_dir']
     # num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
@@ -70,7 +72,7 @@ def main(args):
 
     # fixed parameters
     state_dim = 7
-    lr_backbone = 1e-5
+    lr_backbone = args['lr']
     backbone = 'resnet18'
     if policy_class == 'ACT':
         enc_layers = 4
@@ -121,6 +123,7 @@ def main(args):
     }
 
     config = {
+        'batch_size': batch_size_train,
         'num_steps': num_steps,
         'eval_every': eval_every,
         'validate_every': validate_every,
@@ -147,7 +150,7 @@ def main(args):
     config_path = os.path.join(ckpt_dir, 'config.pkl')
     expr_name = ckpt_dir.split('/')[-1]
     if not is_eval:
-        wandb.init(project="mobile-aloha2", reinit=True, entity="mobile-aloha2", name=expr_name)
+        wandb.init(project="pp", reinit=True, entity="jimzh-personal", name=expr_name)
         wandb.config.update(config)
     with open(config_path, 'wb') as f:
         pickle.dump(config, f)
@@ -205,6 +208,16 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
+def get_scheduler(optimizer, config):
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config["lr"],
+        total_steps=config["num_steps"], 
+        pct_start=0.3,
+    )
+    return scheduler
+
+
 def get_image(ts, camera_names, rand_crop_resize=False):
     curr_images = []
     for cam_name in camera_names:
@@ -225,6 +238,113 @@ def get_image(ts, camera_names, rand_crop_resize=False):
         curr_image = curr_image.unsqueeze(0)
     
     return curr_image
+
+
+def forward_pass(data, policy):
+    image_data, qpos_data, action_data, is_pad = data
+    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+
+
+def train_bc(train_dataloader, val_dataloader, config):
+    num_steps = config['num_steps']
+    ckpt_dir = config['ckpt_dir']
+    seed = config['seed']
+    policy_class = config['policy_class']
+    policy_config = config['policy_config']
+    eval_every = config['eval_every']
+    validate_every = config['validate_every']
+    save_every = config['save_every']
+
+    set_seed(seed)
+
+    policy = make_policy(policy_class, policy_config)
+    if config['load_pretrain']:
+        loading_status = policy.deserialize(torch.load(os.path.join('/home/zfu/interbotix_ws/src/act/ckpts/pretrain_all', 'policy_step_50000_seed_0.ckpt')))
+        print(f'loaded! {loading_status}')
+    if config['resume_ckpt_path'] is not None:
+        loading_status = policy.deserialize(torch.load(config['resume_ckpt_path']))
+        print(f'Resume policy from: {config["resume_ckpt_path"]}, Status: {loading_status}')
+    policy.cuda()
+    optimizer = make_optimizer(policy_class, policy)
+    scheduler = get_scheduler(optimizer, config)
+
+    min_val_loss = np.inf
+    best_ckpt_info = None
+    
+    train_dataloader = repeater(train_dataloader)
+    for step in tqdm(range(num_steps+1)):
+        # validation
+        if step % validate_every == 0:
+            print('validating')
+
+            with torch.inference_mode():
+                policy.eval()
+                validation_dicts = []
+                for batch_idx, data in enumerate(val_dataloader):
+                    forward_dict = forward_pass(data, policy)
+                    validation_dicts.append(forward_dict)
+                    if batch_idx > 50:
+                        break
+
+                validation_summary = compute_dict_mean(validation_dicts)
+
+                epoch_val_loss = validation_summary['loss']
+                if epoch_val_loss < min_val_loss:
+                    min_val_loss = epoch_val_loss
+                    best_ckpt_info = (step, min_val_loss, deepcopy(policy.serialize()))
+            for k in list(validation_summary.keys()):
+                validation_summary[f'val_{k}'] = validation_summary.pop(k)            
+            wandb.log(validation_summary, step=step)
+            print(f'Val loss:   {epoch_val_loss:.5f}')
+            summary_string = ''
+            for k, v in validation_summary.items():
+                summary_string += f'{k}: {v.item():.3f} '
+            print(summary_string)
+                
+        # evaluation
+        if (step > 0) and (step % eval_every == 0):
+            # first save then eval
+            ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
+            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+            torch.save(policy.serialize(), ckpt_path)
+            # success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
+            # wandb.log({'success': success}, step=step)
+
+        # training
+        policy.train()
+        optimizer.zero_grad()
+        data = next(train_dataloader)
+        forward_dict = forward_pass(data, policy)
+        # backward
+        loss = forward_dict['loss']
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        forward_dict["lr"] = scheduler.get_last_lr()[-1]
+        wandb.log(forward_dict, step=step) # not great, make training 1-2% slower
+
+        if step % save_every == 0:
+            ckpt_path = os.path.join(ckpt_dir, f'policy_step_{step}_seed_{seed}.ckpt')
+            torch.save(policy.serialize(), ckpt_path)
+
+    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
+    torch.save(policy.serialize(), ckpt_path)
+
+    best_step, min_val_loss, best_state_dict = best_ckpt_info
+    ckpt_path = os.path.join(ckpt_dir, f'policy_step_{best_step}_seed_{seed}.ckpt')
+    torch.save(best_state_dict, ckpt_path)
+    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at step {best_step}')
+
+    return best_ckpt_info
+
+def repeater(data_loader):
+    epoch = 0
+    for loader in repeat(data_loader):
+        for data in loader:
+            yield data
+        print(f'Epoch {epoch} done')
+        epoch += 1
 
 
 def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
@@ -473,7 +593,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 # time.sleep(max(0, DT - duration - culmulated_delay))
                 if duration >= DT:
                     culmulated_delay += (duration - DT)
-                    print(f'Warning: step duration: {duration:.3f} s at step {t} longer than DT: {DT} s, culmulated delay: {culmulated_delay:.3f} s')
+                    # print(f'Warning: step duration: {duration:.3f} s at step {t} longer than DT: {DT} s, culmulated delay: {culmulated_delay:.3f} s')
                 # else:
                 #     culmulated_delay = max(0, culmulated_delay - (DT - duration))
 
@@ -526,110 +646,6 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         f.write(repr(highest_rewards))
 
     return success_rate, avg_return
-
-
-def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
-
-
-def train_bc(train_dataloader, val_dataloader, config):
-    num_steps = config['num_steps']
-    ckpt_dir = config['ckpt_dir']
-    seed = config['seed']
-    policy_class = config['policy_class']
-    policy_config = config['policy_config']
-    eval_every = config['eval_every']
-    validate_every = config['validate_every']
-    save_every = config['save_every']
-
-    set_seed(seed)
-
-    policy = make_policy(policy_class, policy_config)
-    if config['load_pretrain']:
-        loading_status = policy.deserialize(torch.load(os.path.join('/home/zfu/interbotix_ws/src/act/ckpts/pretrain_all', 'policy_step_50000_seed_0.ckpt')))
-        print(f'loaded! {loading_status}')
-    if config['resume_ckpt_path'] is not None:
-        loading_status = policy.deserialize(torch.load(config['resume_ckpt_path']))
-        print(f'Resume policy from: {config["resume_ckpt_path"]}, Status: {loading_status}')
-    policy.cuda()
-    optimizer = make_optimizer(policy_class, policy)
-
-    min_val_loss = np.inf
-    best_ckpt_info = None
-    
-    train_dataloader = repeater(train_dataloader)
-    for step in tqdm(range(num_steps+1)):
-        # validation
-        if step % validate_every == 0:
-            print('validating')
-
-            with torch.inference_mode():
-                policy.eval()
-                validation_dicts = []
-                for batch_idx, data in enumerate(val_dataloader):
-                    forward_dict = forward_pass(data, policy)
-                    validation_dicts.append(forward_dict)
-                    if batch_idx > 50:
-                        break
-
-                validation_summary = compute_dict_mean(validation_dicts)
-
-                epoch_val_loss = validation_summary['loss']
-                if epoch_val_loss < min_val_loss:
-                    min_val_loss = epoch_val_loss
-                    best_ckpt_info = (step, min_val_loss, deepcopy(policy.serialize()))
-            for k in list(validation_summary.keys()):
-                validation_summary[f'val_{k}'] = validation_summary.pop(k)            
-            wandb.log(validation_summary, step=step)
-            print(f'Val loss:   {epoch_val_loss:.5f}')
-            summary_string = ''
-            for k, v in validation_summary.items():
-                summary_string += f'{k}: {v.item():.3f} '
-            print(summary_string)
-                
-        # evaluation
-        if (step > 0) and (step % eval_every == 0):
-            # first save then eval
-            ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
-            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-            torch.save(policy.serialize(), ckpt_path)
-            # success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
-            # wandb.log({'success': success}, step=step)
-
-        # training
-        policy.train()
-        optimizer.zero_grad()
-        data = next(train_dataloader)
-        forward_dict = forward_pass(data, policy)
-        # backward
-        loss = forward_dict['loss']
-        loss.backward()
-        optimizer.step()
-        wandb.log(forward_dict, step=step) # not great, make training 1-2% slower
-
-        if step % save_every == 0:
-            ckpt_path = os.path.join(ckpt_dir, f'policy_step_{step}_seed_{seed}.ckpt')
-            torch.save(policy.serialize(), ckpt_path)
-
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.serialize(), ckpt_path)
-
-    best_step, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_step_{best_step}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at step {best_step}')
-
-    return best_ckpt_info
-
-def repeater(data_loader):
-    epoch = 0
-    for loader in repeat(data_loader):
-        for data in loader:
-            yield data
-        print(f'Epoch {epoch} done')
-        epoch += 1
 
 
 if __name__ == '__main__':
