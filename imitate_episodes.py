@@ -212,7 +212,7 @@ def get_scheduler(optimizer, config):
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["lr"],
-        total_steps=config["num_steps"], 
+        total_steps=config["num_steps"] + 1,
         pct_start=0.3,
     )
     return scheduler
